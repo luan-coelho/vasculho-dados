@@ -13,7 +13,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
@@ -449,28 +448,7 @@ pub fn build(from: Origin, out: &Path, only_if_new: bool, mut log: impl FnMut(St
             for zip in &zips {
                 let dest = out.join(format!("{}.part", zip.name));
                 let url = format!("{}{month}/{}", webdav(), zip.name);
-                let mut last = None;
-                // A Receita derruba conexões longas: três tentativas por arquivo.
-                for attempt in 1..=3 {
-                    log(format!("baixando {} ({} MB), tentativa {attempt}", zip.name, zip.size / 1_000_000));
-                    let got = download(
-                        &url,
-                        &[("Authorization", &auth), ("User-Agent", USER_AGENT)],
-                        &dest,
-                        zip.size.max(1) + 1024,
-                        &AtomicBool::new(false),
-                        |_| {},
-                    );
-                    match got {
-                        Ok((_, size)) if zip.size == 0 || size == zip.size => {
-                            last = None;
-                            break;
-                        }
-                        Ok((_, size)) => last = Some(anyhow::anyhow!("veio com {size} de {} bytes", zip.size)),
-                        Err(e) => last = Some(e),
-                    }
-                }
-                if let Some(e) = last {
+                if let Err(e) = fetch_zip(&url, &auth, &dest, zip.size, &mut log) {
                     std::fs::remove_file(&dest).ok();
                     return Err(e.context(format!("não deu para baixar {}", zip.name)));
                 }
@@ -490,58 +468,105 @@ pub fn build(from: Origin, out: &Path, only_if_new: bool, mut log: impl FnMut(St
 }
 
 // ---------------------------------------------------------------------------
-/// Baixa `url` para o arquivo `dest` em blocos, sem carregar na memória, e devolve o
-/// SHA-256 (hexadecimal) e o tamanho do que gravou. Não tem tempo total: arquivos
-/// grandes demoram; o limite é ficar 2 minutos sem receber nada. `cancel` é
-/// conferido a cada bloco e `progress` recebe os bytes já gravados. Em erro ou
-/// cancelamento, `dest` é apagado. Quem chama confere o SHA-256 antes de usar.
-fn download(
-    url: &str,
-    headers: &[(&str, &str)],
-    dest: &Path,
-    max_bytes: u64,
-    cancel: &AtomicBool,
-    mut progress: impl FnMut(u64),
-) -> Result<(String, u64)> {
+/// Velocidade mínima aceita para um download: abaixo disso, a tentativa desiste e
+/// a próxima retoma de onde parou.
+const MIN_SPEED: u64 = 200 * 1024;
+
+/// Baixa um zip da Receita para `dest`. Os arquivos têm GB e a Receita derruba
+/// conexões longas, então cada tentativa retoma de onde a anterior parou (`Range`)
+/// em vez de recomeçar. `size` é o tamanho anunciado na lista; 0 é desconhecido.
+fn fetch_zip(url: &str, auth: &str, dest: &Path, size: u64, log: &mut impl FnMut(String)) -> Result<()> {
+    const ATTEMPTS: usize = 8;
+    std::fs::remove_file(dest).ok();
+    let name = url.rsplit('/').next().unwrap_or(url);
+    let mut last = anyhow::anyhow!("nenhuma tentativa");
+    for attempt in 1..=ATTEMPTS {
+        let have = dest.metadata().map_or(0, |m| m.len());
+        log(format!(
+            "baixando {name} ({} MB), tentativa {attempt}{}",
+            size / 1_000_000,
+            if have > 0 { format!(", retomando de {} MB", have / 1_000_000) } else { String::new() }
+        ));
+        match fetch_part(url, auth, dest, have, size, log) {
+            Ok(got) if size == 0 || got == size => return Ok(()),
+            Ok(got) if got > size => {
+                // Veio maior que o anunciado: o parcial não serve, recomeça do zero.
+                std::fs::remove_file(dest).ok();
+                last = anyhow::anyhow!("veio com {got} de {size} bytes");
+            }
+            Ok(got) => last = anyhow::anyhow!("a conexão fechou com {got} de {size} bytes"),
+            Err(e) => {
+                log(format!("  parou: {e:#}"));
+                last = e;
+            }
+        }
+    }
+    Err(last)
+}
+
+/// Uma tentativa: pede a partir de `have` bytes e acrescenta ao que já está em
+/// `dest`. Devolve o tamanho do arquivo no fim. Em erro, o parcial fica para a
+/// próxima tentativa retomar.
+fn fetch_part(url: &str, auth: &str, dest: &Path, have: u64, size: u64, log: &mut impl FnMut(String)) -> Result<u64> {
+    // O ureq conta o tempo do corpo inteiro, não o tempo sem receber: o limite
+    // acompanha o que falta baixar, com folga de 10 minutos.
+    let budget = Duration::from_secs(600 + size.saturating_sub(have) / MIN_SPEED);
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
-            .timeout_connect(Some(Duration::from_secs(20)))
-            .timeout_recv_body(Some(Duration::from_secs(120)))
+            .timeout_connect(Some(Duration::from_secs(30)))
+            .timeout_recv_response(Some(Duration::from_secs(120)))
+            .timeout_recv_body(Some(budget))
+            .http_status_as_error(false)
+            .user_agent(USER_AGENT)
             .build(),
     );
-    let mut request = agent.get(url);
-    for (name, value) in headers {
-        request = request.header(*name, *value);
+    let mut request = agent.get(url).header("Authorization", auth);
+    if have > 0 {
+        request = request.header("Range", format!("bytes={have}-"));
     }
-    let response = request.call().context("sem conexão com a internet; confira e tente de novo")?;
-    let mut reader = response.into_body().into_with_config().limit(max_bytes).reader();
-    let mut file = std::fs::File::create(dest).with_context(|| format!("criando {}", dest.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 256 * 1024];
-    let mut done = 0u64;
-    let outcome = (|| -> Result<()> {
-        loop {
-            if cancel.load(Ordering::Relaxed) {
-                bail!("download cancelado");
+    let response = request.call().context("a Receita não respondeu")?;
+    let mut file = match response.status().as_u16() {
+        206 if have > 0 => std::fs::OpenOptions::new().append(true).open(dest),
+        // Sem suporte a retomada (ou primeira tentativa): começa do zero.
+        200 => std::fs::File::create(dest),
+        // Pediu além do fim: o arquivo já estava completo.
+        416 if have > 0 => return Ok(have),
+        status => bail!("a Receita respondeu {status}"),
+    }
+    .with_context(|| format!("gravando {}", dest.display()))?;
+    let mut done = if response.status().as_u16() == 206 { have } else { 0 };
+    let mut reader = response.into_body().into_with_config().limit(u64::MAX).reader();
+    let mut buf = vec![0u8; 1024 * 1024];
+    let step = (size / 10).max(1);
+    let mut next = (done / step + 1) * step;
+    let started = std::time::Instant::now();
+    let from = done;
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                file.flush().ok();
+                return Err(anyhow::Error::new(e).context(format!("o download parou em {} MB", done / 1_000_000)));
             }
-            let n = reader.read(&mut buf).context("o download parou no meio; tente de novo")?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-            file.write_all(&buf[..n])?;
-            done += n as u64;
-            progress(done);
+        };
+        if n == 0 {
+            break;
         }
-        file.flush()?;
-        Ok(())
-    })();
-    drop(file);
-    if let Err(e) = outcome {
-        std::fs::remove_file(dest).ok();
-        return Err(e);
+        file.write_all(&buf[..n])?;
+        done += n as u64;
+        if size > 0 && done >= next {
+            let secs = started.elapsed().as_secs_f64().max(0.001);
+            log(format!(
+                "  {}% ({} MB, {:.1} MB/s)",
+                done * 100 / size,
+                done / 1_000_000,
+                (done - from) as f64 / 1_000_000.0 / secs
+            ));
+            next = (done / step + 1) * step;
+        }
     }
-    Ok((hex(&hasher.finalize()), done))
+    file.flush()?;
+    Ok(done)
 }
 
 /// Bytes em hexadecimal minúsculo.
