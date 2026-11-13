@@ -1,0 +1,57 @@
+# Uma vez por semana confere se a Receita publicou a base de um mês novo. Se
+# publicou, lê os Estabelecimentos (alguns GB, um arquivo por vez), conta as filiais
+# por raiz de CNPJ e publica o índice como release deste repositório.
+name: Filiais
+
+on:
+  schedule:
+    # Segunda-feira, 06:00 UTC. A Receita publica uma vez por mês, sem dia certo.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: filiais
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    defaults:
+      run:
+        working-directory: gerador
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gerador
+
+      - name: Testes
+        run: cargo test --locked
+
+      # --se-novo: sai sem baixar nada quando o mês da Receita já está publicado.
+      # A validação recusa base cortada ou com o total de filiais muito diferente
+      # do mês anterior; aí o passo falha e o índice antigo continua valendo.
+      - name: Gerar o índice
+        run: cargo run --release --locked -- --se-novo --out dist
+
+      - name: Publicar
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ ! -f dist/latest.json ]; then
+            echo "Nada novo para publicar."
+            exit 0
+          fi
+          mes=$(jq -r .mes dist/latest.json)
+          gh release create "filiais-$mes" "dist/filiais-$mes.zip" dist/latest.json \
+            --repo "$GITHUB_REPOSITORY" --latest \
+            --title "Filiais $mes" \
+            --notes "Contagem de filiais por raiz de CNPJ, da base aberta da Receita Federal de $mes. Só contagens; nenhum dado pessoal."
