@@ -445,17 +445,30 @@ pub fn build(from: Origin, out: &Path, only_if_new: bool, mut log: impl FnMut(St
             let total: u64 = zips.iter().map(|z| z.size).sum();
             log(format!("{} arquivos de {month}, {} MB", zips.len(), total / 1_000_000));
             let auth = basic_auth();
-            for zip in &zips {
+            let started = std::time::Instant::now();
+            let mut downloaded = 0u64;
+            for (i, zip) in zips.iter().enumerate() {
                 let dest = out.join(format!("{}.part", zip.name));
                 let url = format!("{}{month}/{}", webdav(), zip.name);
+                log(format!("[{} de {}] {} ({} MB)", i + 1, zips.len(), zip.name, zip.size / 1_000_000));
                 if let Err(e) = fetch_zip(&url, &auth, &dest, zip.size, &mut log) {
                     std::fs::remove_file(&dest).ok();
                     return Err(e.context(format!("não deu para baixar {}", zip.name)));
                 }
+                let reading = std::time::Instant::now();
                 let read = tally.read_zip(&dest);
                 std::fs::remove_file(&dest).ok();
                 read?;
-                log(format!("  {} estabelecimentos lidos até aqui", tally.estabelecimentos));
+                downloaded += zip.size;
+                log(format!(
+                    "  lido em {} · {} estabelecimentos e {} filiais até aqui · total: {} de {} MB em {}",
+                    elapsed(reading),
+                    tally.estabelecimentos,
+                    tally.filiais,
+                    downloaded / 1_000_000,
+                    total / 1_000_000,
+                    elapsed(started)
+                ));
             }
             month
         }
@@ -472,6 +485,15 @@ pub fn build(from: Origin, out: &Path, only_if_new: bool, mut log: impl FnMut(St
 /// a próxima retoma de onde parou.
 const MIN_SPEED: u64 = 200 * 1024;
 
+/// De quanto em quanto tempo sai uma linha de andamento do download.
+const PROGRESS_EVERY: Duration = Duration::from_secs(30);
+
+/// "3 min 12 s" desde `since`.
+fn elapsed(since: std::time::Instant) -> String {
+    let secs = since.elapsed().as_secs();
+    if secs < 60 { format!("{secs} s") } else { format!("{} min {} s", secs / 60, secs % 60) }
+}
+
 /// Baixa um zip da Receita para `dest`. Os arquivos têm GB e a Receita derruba
 /// conexões longas, então cada tentativa retoma de onde a anterior parou (`Range`)
 /// em vez de recomeçar. `size` é o tamanho anunciado na lista; 0 é desconhecido.
@@ -482,11 +504,9 @@ fn fetch_zip(url: &str, auth: &str, dest: &Path, size: u64, log: &mut impl FnMut
     let mut last = anyhow::anyhow!("nenhuma tentativa");
     for attempt in 1..=ATTEMPTS {
         let have = dest.metadata().map_or(0, |m| m.len());
-        log(format!(
-            "baixando {name} ({} MB), tentativa {attempt}{}",
-            size / 1_000_000,
-            if have > 0 { format!(", retomando de {} MB", have / 1_000_000) } else { String::new() }
-        ));
+        if attempt > 1 {
+            log(format!("  tentativa {attempt} de {ATTEMPTS} de {name}, retomando de {} MB", have / 1_000_000));
+        }
         match fetch_part(url, auth, dest, have, size, log) {
             Ok(got) if size == 0 || got == size => return Ok(()),
             Ok(got) if got > size => {
@@ -537,10 +557,26 @@ fn fetch_part(url: &str, auth: &str, dest: &Path, have: u64, size: u64, log: &mu
     let mut done = if response.status().as_u16() == 206 { have } else { 0 };
     let mut reader = response.into_body().into_with_config().limit(u64::MAX).reader();
     let mut buf = vec![0u8; 1024 * 1024];
-    let step = (size / 10).max(1);
-    let mut next = (done / step + 1) * step;
     let started = std::time::Instant::now();
+    let mut reported = started;
     let from = done;
+    // "42% · 956 de 2277 MB · 6.1 MB/s · faltam 4 min"
+    let progress = |done: u64| {
+        let speed = (done - from) as f64 / started.elapsed().as_secs_f64().max(0.001);
+        let mut line = format!("  {} MB", done / 1_000_000);
+        if let Some(pct) = (done * 100).checked_div(size) {
+            line = format!("  {pct}% · {} de {} MB", done / 1_000_000, size / 1_000_000);
+        }
+        line.push_str(&format!(" · {:.1} MB/s", speed / 1_000_000.0));
+        if size > done && speed > 0.0 {
+            let left = ((size - done) as f64 / speed) as u64;
+            line.push_str(&match left {
+                0..60 => format!(" · faltam {left} s"),
+                _ => format!(" · faltam {} min", left.div_ceil(60)),
+            });
+        }
+        line
+    };
     loop {
         let n = match reader.read(&mut buf) {
             Ok(n) => n,
@@ -554,18 +590,13 @@ fn fetch_part(url: &str, auth: &str, dest: &Path, have: u64, size: u64, log: &mu
         }
         file.write_all(&buf[..n])?;
         done += n as u64;
-        if size > 0 && done >= next {
-            let secs = started.elapsed().as_secs_f64().max(0.001);
-            log(format!(
-                "  {}% ({} MB, {:.1} MB/s)",
-                done * 100 / size,
-                done / 1_000_000,
-                (done - from) as f64 / 1_000_000.0 / secs
-            ));
-            next = (done / step + 1) * step;
+        if reported.elapsed() >= PROGRESS_EVERY {
+            reported = std::time::Instant::now();
+            log(progress(done));
         }
     }
     file.flush()?;
+    log(format!("{} · baixado em {}", progress(done), elapsed(started)));
     Ok(done)
 }
 
